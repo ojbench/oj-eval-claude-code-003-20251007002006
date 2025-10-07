@@ -8,36 +8,29 @@
 #include <unordered_map>
 using namespace std;
 
-struct Submission {
-    char problem;
-    string status;
-    int time;
-    Submission(char p, const string& s, int t) : problem(p), status(s), time(t) {}
-};
-
 struct ProblemStatus {
     int wrong_before = 0;
     bool solved = false;
     int solved_time = -1;
     int submissions_after_freeze = 0;
     bool is_frozen = false;
-    int freeze_time = -1;
 };
 
 struct Team {
     string name;
     vector<ProblemStatus> problems;
-    vector<Submission> submissions;
+    vector<tuple<char, string, int>> submissions; // (problem, status, time)
     long long penalty_time = 0;
     int solved_count = 0;
 
     Team(const string& n, int problem_count) : name(n), problems(problem_count) {}
 
-    void update_ranking() {
+    void calculate_ranking() {
         solved_count = 0;
         penalty_time = 0;
 
-        for (auto& status : problems) {
+        for (int i = 0; i < (int)problems.size(); i++) {
+            const auto& status = problems[i];
             if (status.solved && !status.is_frozen) {
                 solved_count++;
                 penalty_time += 20LL * status.wrong_before + status.solved_time;
@@ -47,7 +40,8 @@ struct Team {
 
     vector<int> get_solved_times() const {
         vector<int> times;
-        for (const auto& status : problems) {
+        for (int i = 0; i < (int)problems.size(); i++) {
+            const auto& status = problems[i];
             if (status.solved && !status.is_frozen) {
                 times.push_back(status.solved_time);
             }
@@ -82,7 +76,6 @@ class ICPCManagement {
 private:
     unordered_map<string, Team*> teams;
     vector<Team*> team_list;
-    set<Team*, TeamComparator> current_ranking;
     bool competition_started = false;
     bool competition_ended = false;
     int duration_time = 0;
@@ -91,6 +84,35 @@ private:
     int freeze_time = -1;
     bool scoreboard_flushed = false;
     set<Team*, TeamComparator> last_flushed_ranking;
+
+    void update_all_rankings() {
+        for (auto team : team_list) {
+            team->calculate_ranking();
+        }
+    }
+
+    void record_submission(Team* team, char problem, const string& status, int time) {
+        team->submissions.emplace_back(problem, status, time);
+        int prob_index = problem - 'A';
+
+        if (prob_index < 0 || prob_index >= problem_count) return;
+
+        ProblemStatus& prob_status = team->problems[prob_index];
+
+        if (is_frozen && !prob_status.solved) {
+            prob_status.submissions_after_freeze++;
+            if (!prob_status.is_frozen) {
+                prob_status.is_frozen = true;
+            }
+        } else if (!is_frozen) {
+            if (status == "Accepted" && !prob_status.solved) {
+                prob_status.solved = true;
+                prob_status.solved_time = time;
+            } else if (status != "Accepted" && !prob_status.solved) {
+                prob_status.wrong_before++;
+            }
+        }
+    }
 
 public:
     ~ICPCManagement() {
@@ -111,7 +133,6 @@ public:
         Team* team = new Team(team_name, problem_count);
         teams[team_name] = team;
         team_list.push_back(team);
-        current_ranking.insert(team);
         cout << "[Info]Add successfully.\n";
     }
 
@@ -128,12 +149,6 @@ public:
             team->problems.resize(problem_count);
         }
 
-        current_ranking.clear();
-        for (auto team : team_list) {
-            team->update_ranking();
-            current_ranking.insert(team);
-        }
-
         cout << "[Info]Competition starts.\n";
     }
 
@@ -144,40 +159,17 @@ public:
         auto it = teams.find(team_name);
         if (it == teams.end()) return;
 
-        Team* team = it->second;
-        char prob_char = problem[0];
-        int prob_index = prob_char - 'A';
-
-        if (prob_index < 0 || prob_index >= problem_count) return;
-
-        team->submissions.emplace_back(prob_char, status, time);
-
-        ProblemStatus& prob_status = team->problems[prob_index];
-
-        if (is_frozen && !prob_status.solved) {
-            prob_status.submissions_after_freeze++;
-            if (!prob_status.is_frozen) {
-                prob_status.is_frozen = true;
-                prob_status.freeze_time = time;
-            }
-        } else if (!is_frozen) {
-            if (status == "Accepted" && !prob_status.solved) {
-                prob_status.solved = true;
-                prob_status.solved_time = time;
-            } else if (status != "Accepted" && !prob_status.solved) {
-                prob_status.wrong_before++;
-            }
-        }
+        record_submission(it->second, problem[0], status, time);
     }
 
     void flush_scoreboard() {
         if (!competition_started || competition_ended) return;
 
         scoreboard_flushed = true;
-        current_ranking.clear();
+        update_all_rankings();
 
+        set<Team*, TeamComparator> current_ranking;
         for (auto team : team_list) {
-            team->update_ranking();
             current_ranking.insert(team);
         }
 
@@ -196,14 +188,6 @@ public:
         is_frozen = true;
         flush_scoreboard();
 
-        for (auto team : team_list) {
-            for (int i = 0; i < problem_count; i++) {
-                if (!team->problems[i].solved) {
-                    team->problems[i].is_frozen = true;
-                }
-            }
-        }
-
         cout << "[Info]Freeze scoreboard.\n";
     }
 
@@ -217,86 +201,45 @@ public:
 
         cout << "[Info]Scroll scoreboard.\n";
 
-        flush_scoreboard();
-        print_scoreboard();
-
-        vector<tuple<string, string, int, long long>> changes;
-
-        while (true) {
-            bool changed = false;
-            Team* lowest_frozen_team = nullptr;
-            char smallest_frozen = 'Z' + 1;
-
-            for (auto team : current_ranking) {
-                for (int i = 0; i < problem_count; i++) {
-                    if (team->problems[i].is_frozen) {
-                        char prob_char = 'A' + i;
-                        if (prob_char < smallest_frozen) {
-                            smallest_frozen = prob_char;
-                            lowest_frozen_team = team;
+        // Update all teams with submissions during freeze
+        for (auto team : team_list) {
+            for (int i = 0; i < problem_count; i++) {
+                if (team->problems[i].is_frozen) {
+                    // Check if this problem was solved during freeze
+                    for (const auto& [prob, status, time] : team->submissions) {
+                        if (prob == ('A' + i) && status == "Accepted") {
+                            team->problems[i].solved = true;
+                            team->problems[i].solved_time = time;
+                            break;
                         }
-                        break;
                     }
+                    team->problems[i].is_frozen = false;
                 }
             }
-
-            if (lowest_frozen_team == nullptr) break;
-
-            int prob_index = smallest_frozen - 'A';
-            ProblemStatus& prob_status = lowest_frozen_team->problems[prob_index];
-
-            for (const auto& sub : lowest_frozen_team->submissions) {
-                if (sub.problem == smallest_frozen && sub.status == "Accepted") {
-                    prob_status.solved = true;
-                    prob_status.solved_time = sub.time;
-                    break;
-                }
-            }
-
-            prob_status.is_frozen = false;
-
-            auto old_ranking = current_ranking;
-            current_ranking.clear();
-            for (auto t : team_list) {
-                t->update_ranking();
-                current_ranking.insert(t);
-            }
-
-            auto old_it = find(old_ranking.begin(), old_ranking.end(), lowest_frozen_team);
-            int old_rank = distance(old_ranking.begin(), old_it) + 1;
-            auto new_it = find(current_ranking.begin(), current_ranking.end(), lowest_frozen_team);
-            int new_rank = distance(current_ranking.begin(), new_it) + 1;
-
-            if (old_rank != new_rank && new_rank < old_rank) {
-                string replaced_team = (*next(old_ranking.rbegin(), old_rank - new_rank))->name;
-                changes.emplace_back(lowest_frozen_team->name, replaced_team,
-                                    lowest_frozen_team->solved_count, lowest_frozen_team->penalty_time);
-                changed = true;
-            }
-
-            if (!changed) break;
         }
 
-        for (const auto& [team1, team2, solved, penalty] : changes) {
-            cout << team1 << " " << team2 << " " << solved << " " << penalty << "\n";
+        // Recalculate rankings
+        update_all_rankings();
+        set<Team*, TeamComparator> final_ranking;
+        for (auto team : team_list) {
+            final_ranking.insert(team);
         }
+
+        // Print scoreboard after scroll
+        print_scoreboard(final_ranking);
 
         is_frozen = false;
-        print_scoreboard();
     }
 
-    void print_scoreboard() {
+    void print_scoreboard(const set<Team*, TeamComparator>& ranking) {
         int rank = 1;
-        for (auto team : current_ranking) {
+        for (auto team : ranking) {
             cout << team->name << " " << rank << " "
                  << team->solved_count << " " << team->penalty_time;
 
             for (int i = 0; i < problem_count; i++) {
                 const ProblemStatus& status = team->problems[i];
-                if (status.is_frozen) {
-                    cout << " " << (status.wrong_before == 0 ? "0" : to_string(status.wrong_before))
-                         << "/" << status.submissions_after_freeze;
-                } else if (status.solved) {
+                if (status.solved) {
                     if (status.wrong_before == 0) {
                         cout << " +";
                     } else {
@@ -363,22 +306,22 @@ public:
         cout << "[Info]Complete query submission.\n";
 
         Team* team = it->second;
-        const Submission* result = nullptr;
+        const tuple<char, string, int>* result = nullptr;
 
-        for (const auto& sub : team->submissions) {
-            bool problem_match = (problem == "ALL" || string(1, sub.problem) == problem);
-            bool status_match = (status == "ALL" || sub.status == status);
+        for (const auto& [prob, stat, time] : team->submissions) {
+            bool problem_match = (problem == "ALL" || string(1, prob) == problem);
+            bool status_match = (status == "ALL" || stat == status);
 
             if (problem_match && status_match) {
-                result = &sub;
+                result = &team->submissions.back();
             }
         }
 
         if (result == nullptr) {
             cout << "Cannot find any submission.\n";
         } else {
-            cout << "[" << team_name << "] [" << result->problem << "] ["
-                 << result->status << "] [" << result->time << "]\n";
+            cout << "[" << team_name << "] [" << get<0>(*result) << "] ["
+                 << get<1>(*result) << "] [" << get<2>(*result) << "]\n";
         }
     }
 
